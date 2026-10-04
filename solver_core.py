@@ -1,5 +1,10 @@
+import os
 import itertools
 from typing import List, Tuple, Dict, Any, Optional
+
+import torch
+import torch.nn as nn
+import numpy as np
 
 # ========================================================
 # [공식 점수 테이블 및 상수 정의]
@@ -40,6 +45,92 @@ RAW_PIECE_POOL = [
     [[1, 0], [1, 1], [1, 0], [1, 1], [1, 0]],                                  # 17
     [[1, 1, 1, 1, 1]]                                                          # 18
 ]
+
+# ========================================================
+# [PyTorch 디바이스 및 모델 정의]
+# ========================================================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_PATH = "puzzle_value_net.pth"
+EMPTY_SLOT_TOKEN = 19
+
+class BoardValueNet(nn.Module):
+    def __init__(self, num_pieces=20, emb_dim=16):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+        self.board_fc = nn.Sequential(
+            nn.Linear(64 * 16 * 10, 128),
+            nn.ReLU()
+        )
+        self.piece_embed = nn.Embedding(num_pieces, emb_dim)
+        self.final_fc = nn.Sequential(
+            nn.Linear(128 + (3 * emb_dim), 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, board_tensor: torch.Tensor, slots_tensor: torch.Tensor) -> torch.Tensor:
+        b_feat = self.conv(board_tensor)
+        b_feat = b_feat.view(b_feat.size(0), -1)
+        b_out = self.board_fc(b_feat)
+
+        p_feat = self.piece_embed(slots_tensor)
+        p_feat = p_feat.view(p_feat.size(0), -1)
+
+        combined = torch.cat([b_out, p_feat], dim=1)
+        return self.final_fc(combined)
+
+# 가중치 파일 로드
+VALUE_NET: Optional[BoardValueNet] = None
+if os.path.exists(MODEL_PATH):
+    try:
+        model = BoardValueNet().to(DEVICE)
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True))
+        model.eval()
+        VALUE_NET = model
+        print(f"★ [RL Solver] 조각 인지 가치망({MODEL_PATH}) 로드 완료 - 연산 디바이스: {DEVICE}")
+    except Exception as e:
+        print(f"[경고] 모델 로드 실패: {e} -> 휴리스틱 폴백 모드로 실행됩니다.")
+
+
+def evaluate_boards_batch(boards: List[List[int]], remaining_slots: List[List[int]]) -> List[float]:
+    """보드와 남은 손패 조각들을 결합하여 일괄 가치 추론"""
+    if not boards:
+        return []
+
+    if VALUE_NET is None:
+        return [float(-sum(POPCOUNT_10[r] for r in b)) for b in boards]
+
+    arr = np.zeros((len(boards), 1, 16, 10), dtype=np.float32)
+    for b_idx, b in enumerate(boards):
+        for r in range(16):
+            row_val = b[r]
+            for c in range(10):
+                if (row_val >> (9 - c)) & 1:
+                    arr[b_idx, 0, r, c] = 1.0
+
+    slots_arr = np.array(remaining_slots, dtype=np.int64)
+
+    with torch.inference_mode():
+        b_tensor = torch.from_numpy(arr).to(DEVICE, non_blocking=True)
+        s_tensor = torch.from_numpy(slots_arr).to(DEVICE, non_blocking=True)
+        values = VALUE_NET(b_tensor, s_tensor).squeeze(-1).tolist()
+        del b_tensor, s_tensor
+
+    if isinstance(values, float):
+        return [values]
+    return values
 
 def rotate_90(grid: List[List[int]]) -> List[List[int]]:
     return [list(row) for row in zip(*grid[::-1])]
@@ -158,15 +249,8 @@ def evaluate_board_state(board: List[int], accumulated_game_score: int, total_cl
     return score
 
 
-# ========================================================
-# [남은 조각 대상 빔 서치 탐색 엔진]
-# ========================================================
 def solve_remaining_pieces(board: List[int], markers: Optional[List[List[int]]],
-                           available_pieces: List[Tuple[int, int]], beam_width: int = 50):
-    """
-    남은 조각에 대해 최적 배치를 탐색.
-    3개를 다 놓지 못하는 포화 상태일 경우, 2개 또는 1개만이라도 놓아 줄을 터뜨리는 최적 생존 플랜 반환.
-    """
+                           available_pieces: List[Tuple[int, int]], beam_width: int = 40):
     if not available_pieces:
         return -float('inf'), None
 
@@ -177,41 +261,47 @@ def solve_remaining_pieces(board: List[int], markers: Optional[List[List[int]]],
     max_steps_found = 0
 
     order_permutations = list(itertools.permutations(range(num_pieces)))
+    MAX_EVAL_CANDIDATES = 120
+
+    # 초기 슬롯 상태 (3개 슬롯 기준 인코딩)
+    base_slots = [EMPTY_SLOT_TOKEN] * 3
+    for s_idx, p_idx in available_pieces:
+        base_slots[s_idx] = p_idx
 
     for perm_order in order_permutations:
-        current_candidates = [(0.0, list(board), None, 0, 0, [])]
+        current_candidates = [(0.0, list(board), list(base_slots), 0, 0, [])]
 
         for step_idx, order_idx in enumerate(perm_order):
             slot_idx, p_idx = available_pieces[order_idx]
-            next_candidates = []
+            raw_branches = []
 
-            for cur_eval, b_state, m_state, score_acc, lines_acc, plan_hist in current_candidates:
+            for cur_eval, b_state, s_state, score_acc, lines_acc, plan_hist in current_candidates:
                 orientations = PROCESSED_PIECES[p_idx]["orientations"]
                 for ori in orientations:
                     for r, c, shift in get_valid_placements(b_state, ori):
                         new_b, _, l_clr, _ = apply_placement(b_state, None, ori, r, shift)
-
                         step_game_score = LINE_SCORES.get(l_clr, l_clr * 1500)
                         tot_game_score = score_acc + step_game_score
                         tot_lines = lines_acc + l_clr
 
-                        step_eval = evaluate_board_state(new_b, tot_game_score, tot_lines)
+                        # 착수 후 슬롯 갱신
+                        new_slots = list(s_state)
+                        new_slots[slot_idx] = EMPTY_SLOT_TOKEN
 
-                        new_step_info = {
+                        quick_score = tot_game_score - sum(POPCOUNT_10[row] for row in new_b) * 2
+
+                        step_info = {
                             "step": step_idx + 1,
                             "piece_slot": slot_idx,
+                            "piece_id": p_idx,
                             "r": r,
                             "c": c,
                             "ori": ori,
                             "cleared_lines": l_clr
                         }
-                        next_candidates.append(
-                            (step_eval, new_b, None, tot_game_score, tot_lines, plan_hist + [new_step_info])
-                        )
+                        raw_branches.append((quick_score, new_b, new_slots, tot_game_score, tot_lines, plan_hist + [step_info]))
 
-            # 만약 이번 단계에서 더 이상 놓을 수 있는 자리가 없다면:
-            # 이전 단계까지 만들어둔 플랜이라도 유효 플랜 후보로 기록 (부분 플랜 폴백)
-            if not next_candidates:
+            if not raw_branches:
                 if current_candidates:
                     top_partial = max(current_candidates, key=lambda x: x[0])
                     partial_steps = len(top_partial[5])
@@ -222,10 +312,23 @@ def solve_remaining_pieces(board: List[int], markers: Optional[List[List[int]]],
                         best_earned_score = top_partial[3]
                 break
 
-            next_candidates.sort(key=lambda x: x[0], reverse=True)
-            current_candidates = next_candidates[:beam_width]
+            # 1차 필터링
+            raw_branches.sort(key=lambda x: x[0], reverse=True)
+            trimmed_branches = raw_branches[:MAX_EVAL_CANDIDATES]
 
-            # 정상적으로 이번 단계를 놓았을 때의 최선책 기록
+            # 2차 정밀 평가: 보드 + 잔여 슬롯 정보를 함께 신경망에 전달
+            boards_to_eval = [item[1] for item in trimmed_branches]
+            slots_to_eval = [item[2] for item in trimmed_branches]
+            neural_values = evaluate_boards_batch(boards_to_eval, slots_to_eval)
+
+            scored_candidates = []
+            for (_, new_b, new_slots, tot_score, tot_lines, plan_hist), v_val in zip(trimmed_branches, neural_values):
+                total_val = (tot_score / 100.0) + float(v_val)
+                scored_candidates.append((total_val, new_b, new_slots, tot_score, tot_lines, plan_hist))
+
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
+            current_candidates = scored_candidates[:beam_width]
+
             top_eval, _, _, top_game_score, _, top_plan = current_candidates[0]
             curr_step_len = len(top_plan)
             if curr_step_len > max_steps_found or (curr_step_len == max_steps_found and top_eval > best_eval):
@@ -236,8 +339,8 @@ def solve_remaining_pieces(board: List[int], markers: Optional[List[List[int]]],
 
     if best_plan:
         total_clears = sum(p["cleared_lines"] for p in best_plan)
-        print(f"-> [AI 판단] {len(best_plan)}개 조각 계획 수립 완료 (예상 득점: +{best_earned_score}점, {total_clears}줄 제거)")
+        print(f"-> [RL AI 판단] {len(best_plan)}개 조각 연계 계획 완료 (예상 득점: +{best_earned_score}점, {total_clears}줄 제거, 평가치: {best_eval:.2f})")
     else:
-        print("-> [AI 판단] 현재 보드 상태에서 놓을 수 있는 조각이 없습니다 (게임 오버 위기).")
+        print("-> [RL AI 판단] 유효한 배치를 찾지 못했습니다.")
 
     return best_eval, best_plan
