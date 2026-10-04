@@ -1,5 +1,4 @@
 # env_puzzle.py
-import random
 from typing import List, Tuple, Dict, Any, Optional
 import gymnasium as gym
 from gymnasium import spaces
@@ -22,6 +21,8 @@ class Puzzle10x16Env(gym.Env):
     - Step 단위: 3개 조각 중 1개를 골라 유효한 (r, c, ori)에 배치
     """
     metadata = {"render_modes": ["ansi"]}
+    REWARD_SCORE_SCALE = 100.0
+    TERMINATION_PENALTY = 20.0
 
     def __init__(self):
         super().__init__()
@@ -43,7 +44,10 @@ class Puzzle10x16Env(gym.Env):
 
     def _refill_slots(self):
         """슬롯 3개에 19종 조각 중 3개를 무작위 보급"""
-        self.slots = [random.randint(0, len(RAW_PIECE_POOL) - 1) for _ in range(3)]
+        self.slots = [
+            int(self.np_random.integers(0, len(RAW_PIECE_POOL)))
+            for _ in range(3)
+        ]
 
     def _get_obs(self) -> Dict[str, np.ndarray]:
         """신경망에 전달할 상태 벡터 (16x10 보드 + 조각 정보)"""
@@ -101,12 +105,7 @@ class Puzzle10x16Env(gym.Env):
         self.total_score += step_score
         self.total_lines_cleared += cleared_lines
 
-        # 3. 보상(Reward) 계산
-        # - 실제 공식 점수를 기반으로 다중 줄 폭파를 장려
-        reward = step_score / 100.0  # 스케일 정규화 (300점 -> +3.0, 7500점 -> +75.0)
-        
-        # 블록 하나를 죽지 않고 안전하게 안착시킨 생존 보너스
-        reward += 0.5
+        reward = step_score / self.REWARD_SCORE_SCALE
 
         # 4. 슬롯 3개를 모두 소진했으면 리필
         if all(s is None for s in self.slots):
@@ -118,10 +117,15 @@ class Puzzle10x16Env(gym.Env):
         truncated = False
 
         if terminated:
-            # 사망 패널티 (점수에 비례해 아쉬운 죽음 방지)
-            reward -= 20.0
+            reward -= self.TERMINATION_PENALTY
 
-        return self._get_obs(), reward, terminated, truncated, {"score": self.total_score}
+        info = {
+            "score": self.total_score,
+            "step_score": step_score,
+            "cleared_lines": cleared_lines,
+            "termination_penalty": self.TERMINATION_PENALTY if terminated else 0.0,
+        }
+        return self._get_obs(), reward, terminated, truncated, info
 
     def render(self):
         """디버깅용 아스키 아트 출력"""

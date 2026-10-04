@@ -51,7 +51,49 @@ RAW_PIECE_POOL = [
 # ========================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = "puzzle_value_net.pth"
+ACTION_Q_MODEL_PATH = "puzzle_action_q_net.pth"
 EMPTY_SLOT_TOKEN = 19
+ActionEncoding = Tuple[int, int, Tuple[int, int, Tuple[int, ...]], int, int, int]
+
+
+class ActionValueNet(nn.Module):
+    def __init__(self, num_pieces=20, emb_dim=8):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(2, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(),
+        )
+        self.board_fc = nn.Sequential(nn.Linear(64 * 16 * 10, 128), nn.ReLU())
+        self.piece_embed = nn.Embedding(num_pieces, emb_dim)
+        self.action_slot_embed = nn.Embedding(3, emb_dim)
+        self.final_fc = nn.Sequential(
+            nn.Linear(128 + (4 * emb_dim), 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(
+        self,
+        board_tensor: torch.Tensor,
+        slots_tensor: torch.Tensor,
+        placement_tensor: torch.Tensor,
+        action_slots_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        state_action = torch.cat([board_tensor, placement_tensor], dim=1)
+        board_features = self.board_fc(self.conv(state_action).flatten(start_dim=1))
+        piece_features = self.piece_embed(slots_tensor).flatten(start_dim=1)
+        action_features = self.action_slot_embed(action_slots_tensor)
+        combined = torch.cat([board_features, piece_features, action_features], dim=1)
+        return self.final_fc(combined)
 
 class BoardValueNet(nn.Module):
     def __init__(self, num_pieces=20, emb_dim=16):
@@ -102,6 +144,19 @@ if os.path.exists(MODEL_PATH):
         print(f"★ [RL Solver] 조각 인지 가치망({MODEL_PATH}) 로드 완료 - 연산 디바이스: {DEVICE}")
     except Exception as e:
         print(f"[경고] 모델 로드 실패: {e} -> 휴리스틱 폴백 모드로 실행됩니다.")
+
+ACTION_Q_NET: Optional[ActionValueNet] = None
+if os.path.exists(ACTION_Q_MODEL_PATH):
+    try:
+        action_q_model = ActionValueNet().to(DEVICE)
+        action_q_model.load_state_dict(
+            torch.load(ACTION_Q_MODEL_PATH, map_location=DEVICE, weights_only=True)
+        )
+        action_q_model.eval()
+        ACTION_Q_NET = action_q_model
+        print(f"★ [RL Solver] 행동 Q망({ACTION_Q_MODEL_PATH}) 로드 완료 - 연산 디바이스: {DEVICE}")
+    except Exception as e:
+        print(f"[경고] 행동 Q망 로드 실패: {e} -> 기존 솔버로 실행됩니다.")
 
 
 def evaluate_boards_batch(boards: List[List[int]], remaining_slots: List[List[int]]) -> List[float]:
@@ -187,6 +242,64 @@ def get_valid_placements(board: List[int], orientation: Tuple[int, int, Tuple[in
     return valid
 
 
+def encode_action(action: Dict[str, Any]) -> ActionEncoding:
+    return (
+        action["slot_idx"], action["piece_idx"], action["ori"],
+        action["r"], action["c"], action["shift"],
+    )
+
+
+def get_legal_action_encodings(
+    board: List[int], slots: List[Optional[int]]
+) -> List[ActionEncoding]:
+    actions = []
+    for slot_idx, piece_idx in enumerate(slots):
+        if piece_idx is None or piece_idx == EMPTY_SLOT_TOKEN:
+            continue
+        for orientation in PROCESSED_PIECES[piece_idx]["orientations"]:
+            for r, c, shift in get_valid_placements(board, orientation):
+                actions.append((slot_idx, piece_idx, orientation, r, c, shift))
+    return actions
+
+
+ROW_BITS_LOOKUP = torch.tensor(
+    [[(value >> (9 - col)) & 1 for col in range(10)] for value in range(1024)],
+    dtype=torch.float32,
+    device=DEVICE,
+)
+
+
+def evaluate_action_values(
+    board: List[int],
+    slots: List[Optional[int]],
+    actions: List[ActionEncoding],
+) -> List[float]:
+    if not actions or ACTION_Q_NET is None:
+        return []
+
+    board_rows = torch.tensor([board] * len(actions), dtype=torch.long, device=DEVICE)
+    slot_rows = torch.tensor(
+        [[EMPTY_SLOT_TOKEN if piece is None else piece for piece in slots]] * len(actions),
+        dtype=torch.long,
+        device=DEVICE,
+    )
+    placement_rows = [[0] * 16 for _ in actions]
+    for action_idx, (_, _, orientation, r, _, shift) in enumerate(actions):
+        for row_idx, row_bits in enumerate(orientation[2]):
+            placement_rows[action_idx][r + row_idx] = row_bits << shift
+    placement_indices = torch.tensor(placement_rows, dtype=torch.long, device=DEVICE)
+    action_slots = torch.tensor([action[0] for action in actions], dtype=torch.long, device=DEVICE)
+
+    with torch.inference_mode():
+        values = ACTION_Q_NET(
+            ROW_BITS_LOOKUP[board_rows].unsqueeze(1),
+            slot_rows,
+            ROW_BITS_LOOKUP[placement_indices].unsqueeze(1),
+            action_slots,
+        ).squeeze(-1)
+    return values.cpu().tolist()
+
+
 def apply_placement(board: List[int], markers: Optional[List[List[int]]],
                     orientation: Tuple[int, int, Tuple[int, ...]], r: int, shift: int):
     """조각을 보드에 비트 연산으로 배치하고 채워진 가로줄을 삭제"""
@@ -249,10 +362,61 @@ def evaluate_board_state(board: List[int], accumulated_game_score: int, total_cl
     return score
 
 
+def solve_remaining_pieces_with_q(
+    board: List[int], available_pieces: List[Tuple[int, int]]
+):
+    current_board = list(board)
+    current_slots: List[Optional[int]] = [EMPTY_SLOT_TOKEN] * 3
+    for slot_idx, piece_idx in available_pieces:
+        current_slots[slot_idx] = piece_idx
+
+    plan = []
+    earned_score = 0
+    first_action_value = -float("inf")
+    for step_idx in range(len(available_pieces)):
+        actions = get_legal_action_encodings(current_board, current_slots)
+        values = evaluate_action_values(current_board, current_slots, actions)
+        if not values:
+            break
+
+        chosen_idx = int(np.argmax(values))
+        slot_idx, piece_idx, orientation, r, c, shift = actions[chosen_idx]
+        if step_idx == 0:
+            first_action_value = float(values[chosen_idx])
+        current_board, _, cleared_lines, _ = apply_placement(
+            current_board, None, orientation, r, shift
+        )
+        earned_score += LINE_SCORES.get(cleared_lines, cleared_lines * 1500)
+        current_slots[slot_idx] = EMPTY_SLOT_TOKEN
+        plan.append({
+            "step": step_idx + 1,
+            "piece_slot": slot_idx,
+            "piece_id": piece_idx,
+            "r": r,
+            "c": c,
+            "ori": orientation,
+            "cleared_lines": cleared_lines,
+        })
+
+    if plan:
+        total_clears = sum(item["cleared_lines"] for item in plan)
+        print(
+            f"-> [RL Q 판단] {len(plan)}개 조각 연계 계획 완료 "
+            f"(예상 득점: +{earned_score}점, {total_clears}줄 제거, "
+            f"첫 행동 Q: {first_action_value:.2f})"
+        )
+    else:
+        print("-> [RL Q 판단] 유효한 배치를 찾지 못했습니다.")
+    return first_action_value, plan
+
+
 def solve_remaining_pieces(board: List[int], markers: Optional[List[List[int]]],
                            available_pieces: List[Tuple[int, int]], beam_width: int = 40):
     if not available_pieces:
         return -float('inf'), None
+
+    if ACTION_Q_NET is not None:
+        return solve_remaining_pieces_with_q(board, available_pieces)
 
     num_pieces = len(available_pieces)
     best_eval = -float('inf')
